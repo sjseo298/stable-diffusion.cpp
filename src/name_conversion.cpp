@@ -211,7 +211,6 @@ std::string convert_cond_stage_model_name(std::string name, std::string prefix, 
         {"ffn_norm.", "post_attention_layernorm."},
         {"layer_output_scale.weight", "layer_scalar"},
         {"output_norm.", "model.norm."},
-        {"output.weight", "lm_head.weight"},
     };
 
     static const std::vector<std::pair<std::string, std::string>> llm_vision_name_map{

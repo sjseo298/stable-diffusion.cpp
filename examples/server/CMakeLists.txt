@@ -75,7 +75,6 @@ add_executable(${TARGET}
     async_jobs.cpp
     routes_index.cpp
     routes_openai.cpp
-    routes_chat.cpp
     routes_sdapi.cpp
     routes_sdcpp.cpp
     routes_dgl.cpp
@@ -105,8 +104,6 @@ foreach(RECIPE_FILE IN LISTS BUILTIN_RECIPE_FILES)
 endforeach()
 configure_file(recipes_builtin.h.in "${CMAKE_CURRENT_BINARY_DIR}/recipes_builtin.h" @ONLY)
 target_include_directories(${TARGET} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-# Chat endpoint reuses the internal DGL chat operation (src/dgl/ops/chat.h).
-target_include_directories(${TARGET} PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE stable-diffusion ${CMAKE_THREAD_LIBS_INIT})
