@@ -61,12 +61,6 @@ namespace {
         return "data: " + j.dump() + "\n\n";
     }
 
-    // OpenAI error shape: clients (opencode/AI-SDK) validate {error:{message}} and
-    // reject a bare string error, both in SSE events and JSON responses.
-    json error_body(const std::string& message) {
-        return json({{"error", {{"message", message}}}});
-    }
-
     bool parse_chat_request(const httplib::Request& req, ServerRuntime& runtime,
                             sd::dgl::ops::ChatRequest& chat, std::string& model,
                             bool& stream, std::string& error) {
@@ -115,7 +109,6 @@ namespace {
             chat.messages.push_back({role, content});
         }
         chat.max_tokens  = std::max(1, j.value("max_tokens", 256));
-        chat.max_context_tokens = std::max(1024, j.value("max_context_tokens", 32768));
         chat.temperature  = j.value("temperature", 0.f);
         chat.top_p        = j.value("top_p", 1.f);
         chat.use_kv_cache = j.value("use_kv_cache", true);
@@ -155,13 +148,13 @@ void register_chat_endpoints(httplib::Server& svr, ServerRuntime& rt) {
         bool stream = false;
         if (!parse_chat_request(req, *runtime, chat, model, stream, error)) {
             res.status = 400;
-            res.set_content(error_body(error).dump(), "application/json");
+            res.set_content(json({{"error", error}}).dump(), "application/json");
             return;
         }
         auto* ctx = sd_ctx_get_dgl_ctx(runtime->sd_ctx);
         if (!ctx) {
             res.status = 503;
-            res.set_content(error_body("no execution context").dump(), "application/json");
+            res.set_content(json({{"error", "no execution context"}}).dump(), "application/json");
             return;
         }
         const std::string id = "chatcmpl-" + std::to_string(unix_timestamp_now_ms());
@@ -172,7 +165,7 @@ void register_chat_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             const auto result = sd::dgl::ops::generate_chat(*ctx, chat);
             if (!result.error.empty()) {
                 res.status = 500;
-                res.set_content(error_body(result.error).dump(), "application/json");
+                res.set_content(json({{"error", result.error}}).dump(), "application/json");
                 return;
             }
             json choice;
@@ -211,7 +204,7 @@ void register_chat_endpoints(httplib::Server& svr, ServerRuntime& rt) {
             const std::string finish = result.error.empty() ? result.finish_reason : "stop";
             raw->push(sse_data(make_chat_chunk(id, model, json::object(), json(finish))));
             if (!result.error.empty())
-                raw->push(sse_data(error_body(result.error)));
+                raw->push(sse_data(json({{"error", result.error}})));
             raw->push("data: [DONE]\n\n");
             {
                 std::lock_guard<std::mutex> lock(raw->mutex);
