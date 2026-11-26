@@ -29,12 +29,13 @@ Global LoRA rule:
 
 ### OpenAI API
 
-Compatibility API shaped like OpenAI image endpoints.
+Compatibility API shaped like OpenAI image and chat endpoints.
 
 Current generation-related endpoints include:
 
 - `POST /v1/images/generations`
 - `POST /v1/images/edits`
+- `POST /v1/chat/completions` (chat with the resident LLM text encoder)
 - `GET /v1/models`
 
 ### Stable Diffusion WebUI API
@@ -511,6 +512,30 @@ Response fields:
 | `data[].id` | `string` | Currently fixed to `sd-cpp-local` |
 | `data[].object` | `string` | Currently fixed to `model` |
 | `data[].owned_by` | `string` | Currently fixed to `local` |
+
+#### `POST /v1/chat/completions`
+
+Chat with the LLM text encoder (`--llm`) of the loaded model, reusing the weights already
+resident in this process (shared with image conditioning — no second model copy). Requires a
+model whose text encoder is a chat-capable LLM (e.g. Qwen3-VL / Qwen2.5-VL GGUF in the `llm`
+slot of a recipe). The encoder is loaded on demand if no generation has run yet.
+
+Request fields:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `messages` | `array<object>` | Required. `{role: system/user/assistant, content: string}`; formatted as ChatML |
+| `max_tokens` | `int` | Default 256 |
+| `temperature` | `float` | Default 0 (greedy). >0 enables sampling |
+| `top_p` | `float` | Default 1.0; nucleus cutoff when <1 |
+| `stream` | `bool` | Default false. When true, responds with SSE `chat.completion.chunk` deltas and a final `data: [DONE]` |
+| `use_kv_cache` | `bool` | Default true (incremental K/V decode). False selects the full-recompute reference path |
+| `model` | `string` | Accepted and ignored (the loaded model's encoder is used) |
+
+Response: OpenAI-compatible `chat.completion` object with `choices[0].message`, `finish_reason`
+(`stop` on EOS / `length` on token or context cap) and `usage` token counts. Context is capped
+at 4096 tokens by default. Chat and image generation are serialized by the same context mutex.
+Errors: 400 invalid request, 500 generation failure (message in `error`).
 
 ### Output Options
 

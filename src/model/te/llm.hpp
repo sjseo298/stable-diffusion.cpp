@@ -1542,6 +1542,17 @@ namespace LLM {
         }
     };
 
+    // Incremental decode state for chat: per-layer K/V history kept in the runner's
+    // session cache (grow-by-concat). Conditioning passes nullptr and is unchanged.
+    struct LLMKVCache {
+        int64_t n_past      = 0;
+        std::string prefix  = "llm_kv";
+        std::vector<ggml_tensor*> k_prev;  // resolved from the session cache before build_graph
+        std::vector<ggml_tensor*> v_prev;
+        std::vector<ggml_tensor*> k_full;  // filled by Attention, staged by the runner
+        std::vector<ggml_tensor*> v_full;
+    };
+
     struct Attention : public GGMLBlock {
     protected:
         LLMArch arch;
@@ -1628,7 +1639,9 @@ namespace LLM {
                              ggml_tensor* attention_mask = nullptr,
                              int rope_index              = 0,
                              ggml_tensor* rope_cos       = nullptr,
-                             ggml_tensor* rope_sin       = nullptr) {
+                             ggml_tensor* rope_sin       = nullptr,
+                             LLMKVCache* kv              = nullptr,
+                             int kv_layer                = -1) {
             // x: [N, n_token, hidden_size]
             int64_t n_token = x->ne[1];
             int64_t N       = x->ne[2];
@@ -1865,6 +1878,30 @@ namespace LLM {
                 k               = ggml_rope_multi(ctx->ggml_ctx, k, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_MROPE, 128000, 1000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
             }
 
+            if (kv != nullptr && kv_layer >= 0 && N == 1) {
+                // Incremental decode: append this step's K/V (F16) to the per-layer history
+                // and attend over the full cache with the caller's rectangular causal mask.
+                ggml_tensor* k_new = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx, k, 0, 2, 1, 3));
+                k_new              = ggml_reshape_3d(ctx->ggml_ctx, k_new, k_new->ne[0], k_new->ne[1], k_new->ne[2] * k_new->ne[3]);
+                k_new              = ggml_cast(ctx->ggml_ctx, k_new, GGML_TYPE_F16);
+                ggml_tensor* v_new = ggml_cast(ctx->ggml_ctx, v, GGML_TYPE_F16);
+                ggml_tensor* k_full = k_new;
+                ggml_tensor* v_full = v_new;
+                if (kv->n_past > 0 && kv_layer < static_cast<int>(kv->k_prev.size()) && kv->k_prev[kv_layer] != nullptr) {
+                    k_full = ggml_concat(ctx->ggml_ctx, kv->k_prev[kv_layer], k_new, 1);
+                    v_full = ggml_concat(ctx->ggml_ctx, kv->v_prev[kv_layer], v_new, 2);
+                }
+                if (kv_layer < static_cast<int>(kv->k_full.size())) {
+                    kv->k_full[kv_layer] = k_full;
+                    kv->v_full[kv_layer] = v_full;
+                }
+                ggml_tensor* q_attn = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx, q, 0, 2, 1, 3));
+                q_attn              = ggml_reshape_3d(ctx->ggml_ctx, q_attn, q_attn->ne[0], q_attn->ne[1], q_attn->ne[2] * q_attn->ne[3]);
+                x                   = ggml_ext_attention_ext(ctx, q_attn, k_full, v_full, num_heads, attention_mask, true, ctx->flash_attn_enabled);
+                x                   = out_proj->forward(ctx, x);
+                return x;
+            }
+
             if (unscaled_attention) {
                 // Gemma 4 attends with scaling=1.0; undo the helper's own 1/sqrt(head_dim).
                 q = ggml_ext_scale(ctx, q, std::sqrt(static_cast<float>(head_dim)));
@@ -1911,6 +1948,7 @@ namespace LLM {
     protected:
         LLMArch arch;
         int sliding_attention;
+        int layer_index;
         bool has_layer_scalar;
         std::string post_attention_norm_name;
         std::string pre_ffw_norm_name;
@@ -1929,6 +1967,7 @@ namespace LLM {
         TransformerBlock(const LLMConfig& config, int layer_index)
             : arch(config.arch),
               sliding_attention(0),
+              layer_index(layer_index),
               has_layer_scalar(config.layer_scalar) {
             if (config.arch == LLMArch::GEMMA4_12B) {
                 post_attention_norm_name = "post_attention_layernorm";
@@ -1983,7 +2022,8 @@ namespace LLM {
                              ggml_tensor* sliding_attention_mask = nullptr,
                              ggml_tensor* image_mask             = nullptr,
                              ggml_tensor* rope_cos               = nullptr,
-                             ggml_tensor* rope_sin               = nullptr) {
+                             ggml_tensor* rope_sin               = nullptr,
+                             LLMKVCache* kv                      = nullptr) {
             // x: [N, n_token, hidden_size]
             auto self_attn                                  = blocks.count("self_attn") ? std::dynamic_pointer_cast<Attention>(blocks["self_attn"]) : nullptr;
             auto input_layernorm                            = std::dynamic_pointer_cast<LLMRMSNorm>(blocks["input_layernorm"]);
@@ -2008,7 +2048,7 @@ namespace LLM {
             if (blocks.count("linear_attn")) {
                 x = std::dynamic_pointer_cast<Qwen35DeltaNet>(blocks["linear_attn"])->forward(ctx, x);
             } else {
-                x = self_attn->forward(ctx, x, input_pos, block_attention_mask, rope_index, rope_cos, rope_sin);
+                x = self_attn->forward(ctx, x, input_pos, block_attention_mask, rope_index, rope_cos, rope_sin, kv, layer_index);
             }
             if (post_attention_norm != nullptr) {
                 x = post_attention_norm->forward(ctx, x);
@@ -2041,6 +2081,14 @@ namespace LLM {
         }
     };
 
+    struct LLMEmbedding : public Embedding {
+        using Embedding::Embedding;
+
+        ggml_tensor* weight() {
+            return params["weight"];
+        }
+    };
+
     struct TextModel : public GGMLBlock {
     protected:
         int64_t num_layers;
@@ -2050,7 +2098,7 @@ namespace LLM {
     public:
         TextModel(const LLMConfig& config, const std::string& graph_cut_prefix = "llm.text")
             : num_layers(config.num_layers), config(config), graph_cut_prefix(graph_cut_prefix) {
-            blocks["embed_tokens"] = std::shared_ptr<GGMLBlock>(new Embedding(config.vocab_size, config.hidden_size));
+            blocks["embed_tokens"] = std::shared_ptr<GGMLBlock>(new LLMEmbedding(config.vocab_size, config.hidden_size));
             for (int i = 0; i < num_layers; i++) {
                 blocks["layers." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new TransformerBlock(config, i));
             }
@@ -2066,6 +2114,10 @@ namespace LLM {
             return x;
         }
 
+        ggml_tensor* embed_tokens_weight() {
+            return std::dynamic_pointer_cast<LLMEmbedding>(blocks["embed_tokens"])->weight();
+        }
+
         ggml_tensor* forward_embeds(GGMLRunnerContext* ctx,
                                     ggml_tensor* x,
                                     ggml_tensor* input_pos,
@@ -2076,7 +2128,8 @@ namespace LLM {
                                     bool return_all_hidden_states                                                        = false,
                                     ggml_tensor* image_mask                                                              = nullptr,
                                     ggml_tensor* rope_cos                                                                = nullptr,
-                                    ggml_tensor* rope_sin                                                                = nullptr) {
+                                    ggml_tensor* rope_sin                                                                = nullptr,
+                                    LLMKVCache* kv                                                                       = nullptr) {
             auto norm = config.final_norm ? std::dynamic_pointer_cast<LLMRMSNorm>(blocks["norm"])
                                           : nullptr;
             std::vector<ggml_tensor*> intermediate_outputs;
@@ -2092,7 +2145,7 @@ namespace LLM {
             for (int i = 0; i < num_layers; i++) {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["layers." + std::to_string(i)]);
 
-                x = block->forward(ctx, x, input_pos, attention_mask, sliding_attention_mask, image_mask, rope_cos, rope_sin);
+                x = block->forward(ctx, x, input_pos, attention_mask, sliding_attention_mask, image_mask, rope_cos, rope_sin, kv);
                 if (i < static_cast<int>(deepstack_image_embeds.size())) {
                     x = add_deepstack_image_embeds(ctx, x, deepstack_image_embeds[static_cast<size_t>(i)]);
                 }
@@ -2139,7 +2192,8 @@ namespace LLM {
                              std::vector<std::pair<int, ggml_tensor*>> image_embeds,
                              const std::vector<std::vector<std::pair<int, ggml_tensor*>>>& deepstack_image_embeds,
                              std::set<int> out_layers,
-                             bool return_all_hidden_states = false) {
+                             bool return_all_hidden_states = false,
+                             LLMKVCache* kv                = nullptr) {
             // input_ids: [N, n_token]
             // return: [N, n_token, hidden_size]
             auto x = embed(ctx, input_ids);
@@ -2151,13 +2205,30 @@ namespace LLM {
                                   std::move(out_layers),
                                   deepstack_image_embeds,
                                   sliding_attention_mask,
-                                  return_all_hidden_states);
+                                  return_all_hidden_states,
+                                  nullptr,
+                                  nullptr,
+                                  nullptr,
+                                  kv);
         }
     };
 
     struct LLM : public GGMLBlock {
         bool enable_vision;
         LLMConfig config;
+
+    protected:
+        void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
+            // The output head is optional: tied-embedding checkpoints (e.g. Qwen3-VL-4B)
+            // ship no lm_head, and the loader rejects declared tensors missing from the file.
+            if (tensor_storage_map.count(prefix + "lm_head.weight") > 0) {
+                ggml_type wtype = get_type(prefix + "lm_head.weight", tensor_storage_map, GGML_TYPE_F32);
+                if (config.hidden_size % ggml_blck_size(wtype) != 0) {
+                    wtype = GGML_TYPE_F32;
+                }
+                params["lm_head.weight"] = ggml_new_tensor_2d(ctx, wtype, config.hidden_size, config.vocab_size);
+            }
+        }
 
     public:
         LLM() = default;
@@ -2177,7 +2248,8 @@ namespace LLM {
                              std::vector<std::pair<int, ggml_tensor*>> image_embeds,
                              const std::vector<std::vector<std::pair<int, ggml_tensor*>>>& deepstack_image_embeds,
                              std::set<int> out_layers,
-                             bool return_all_hidden_states = false) {
+                             bool return_all_hidden_states = false,
+                             LLMKVCache* kv                = nullptr) {
             // input_ids: [N, n_token]
             auto model = std::dynamic_pointer_cast<TextModel>(blocks["model"]);
 
@@ -2189,13 +2261,32 @@ namespace LLM {
                                     image_embeds,
                                     deepstack_image_embeds,
                                     out_layers,
-                                    return_all_hidden_states);
+                                    return_all_hidden_states,
+                                    kv);
             return x;
         }
 
         ggml_tensor* embed(GGMLRunnerContext* ctx, ggml_tensor* input_ids) {
             auto model = std::dynamic_pointer_cast<TextModel>(blocks["model"]);
             return model->embed(ctx, input_ids);
+        }
+
+        bool has_output_weight() const {
+            return params.count("lm_head.weight") > 0;
+        }
+
+        // Effective lm_head: the dedicated output weight when loaded, otherwise the tied
+        // token embedding, so text generation always has an output weight available.
+        ggml_tensor* output_weight() {
+            auto it = params.find("lm_head.weight");
+            if (it != params.end()) {
+                return it->second;
+            }
+            return std::dynamic_pointer_cast<TextModel>(blocks["model"])->embed_tokens_weight();
+        }
+
+        ggml_tensor* logits(GGMLRunnerContext* ctx, ggml_tensor* hidden_states) {
+            return ggml_mul_mat(ctx->ggml_ctx, output_weight(), hidden_states);
         }
 
         std::shared_ptr<VisionModel> vision_model() {
@@ -2501,7 +2592,8 @@ namespace LLM {
                              std::vector<std::pair<int, ggml_tensor*>> image_embeds,
                              const std::vector<std::vector<std::pair<int, ggml_tensor*>>>& deepstack_image_embeds,
                              std::set<int> out_layers,
-                             bool return_all_hidden_states = false) {
+                             bool return_all_hidden_states = false,
+                             LLMKVCache* kv                = nullptr) {
             auto hidden_states = model.forward(ctx,
                                                input_ids,
                                                input_pos,
@@ -2510,7 +2602,8 @@ namespace LLM {
                                                image_embeds,
                                                deepstack_image_embeds,
                                                out_layers,
-                                               return_all_hidden_states);  // [N, n_token, hidden_size]
+                                               return_all_hidden_states,
+                                               kv);  // [N, n_token, hidden_size]
             return hidden_states;
         }
 
@@ -2586,7 +2679,10 @@ namespace LLM {
                                  const std::vector<ImageGrid>& image_grids,
                                  std::set<int> out_layers,
                                  bool return_all_hidden_states           = false,
-                                 const sd::Tensor<int32_t>& position_ids = {}) {
+                                 const sd::Tensor<int32_t>& position_ids = {},
+                                 bool with_logits                        = false,
+                                 bool logits_last_token_only             = true,
+                                 LLMKVCache* kv                          = nullptr) {
             ggml_cgraph* gf        = new_graph_custom(LLM_GRAPH_SIZE);
             ggml_tensor* input_ids = make_input(input_ids_tensor);
             std::vector<std::pair<int, ggml_tensor*>> image_embeds;
@@ -2671,7 +2767,31 @@ namespace LLM {
                                                  image_embeds,
                                                  deepstack_image_embeds,
                                                  out_layers,
-                                                 return_all_hidden_states);
+                                                 return_all_hidden_states,
+                                                 kv);
+
+            if (kv != nullptr) {
+                // Stage the grown K/V history; the engine captures it into the session
+                // cache after compute so the next decode step can concat onto it.
+                for (size_t i = 0; i < kv->k_full.size(); i++) {
+                    if (kv->k_full[i] != nullptr)
+                        cache(kv->prefix + ".k." + std::to_string(i), kv->k_full[i]);
+                    if (kv->v_full[i] != nullptr)
+                        cache(kv->prefix + ".v." + std::to_string(i), kv->v_full[i]);
+                }
+            }
+
+            if (with_logits) {
+                if (logits_last_token_only) {
+                    hidden_states = ggml_view_2d(runner_ctx.ggml_ctx,
+                                                 hidden_states,
+                                                 hidden_states->ne[0],
+                                                 1,
+                                                 hidden_states->nb[1],
+                                                 (hidden_states->ne[1] - 1) * hidden_states->nb[1]);
+                }
+                hidden_states = model.logits(&runner_ctx, hidden_states);
+            }
 
             ggml_build_forward_expand(gf, hidden_states);
 
@@ -2700,6 +2820,65 @@ namespace LLM {
             };
             return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, auto_runner_end),
                                                    input_ids.dim() + 1);
+        }
+
+        // Text-generation path: runs the backbone plus the effective output weight and reads
+        // the logits back to host as float, shaped [vocab_size, n_tokens], or [vocab_size, 1]
+        // when only the last token is requested. Empty attention_mask builds the causal mask;
+        // explicit position_ids override the default positions.
+        sd::Tensor<float> compute_logits(const int n_threads,
+                                         const sd::Tensor<int32_t>& input_ids,
+                                         const sd::Tensor<float>& attention_mask = {},
+                                         const sd::Tensor<int32_t>& position_ids = {},
+                                         bool last_token_only                    = true,
+                                         bool auto_runner_end                    = true,
+                                         LLMKVCache* kv                          = nullptr) {
+            if (kv != nullptr) {
+                const int n_layers = config.num_layers;
+                kv->k_prev.assign(n_layers, nullptr);
+                kv->v_prev.assign(n_layers, nullptr);
+                kv->k_full.assign(n_layers, nullptr);
+                kv->v_full.assign(n_layers, nullptr);
+                if (kv->n_past > 0) {
+                    for (int i = 0; i < n_layers; i++) {
+                        kv->k_prev[i] = get_cache_tensor_by_name(kv->prefix + ".k." + std::to_string(i));
+                        kv->v_prev[i] = get_cache_tensor_by_name(kv->prefix + ".v." + std::to_string(i));
+                    }
+                }
+            }
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_graph(input_ids,
+                                   attention_mask,
+                                   {},
+                                   {},
+                                   {},
+                                   {},
+                                   false,
+                                   position_ids,
+                                   true,
+                                   last_token_only,
+                                   kv);
+            };
+            return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, auto_runner_end), 2);
+        }
+
+        // Drop the chat K/V history held in the session cache (end of a chat session).
+        void clear_kv_cache() {
+            free_cache_ctx_and_buffer();
+        }
+
+        // Position ids for incremental text decode: the tail of the full sequence's
+        // positions (all M-RoPE sections share the text position; no image grids).
+        std::vector<int> decode_position_ids(int64_t n_past, int64_t n_new) const {
+            const auto full      = build_position_ids(config, n_past + n_new, {});
+            const int64_t total  = n_past + n_new;
+            const int64_t sections = static_cast<int64_t>(full.size()) / total;
+            std::vector<int> out;
+            out.reserve(static_cast<size_t>(sections * n_new));
+            for (int64_t s = 0; s < sections; s++)
+                for (int64_t i = 0; i < n_new; i++)
+                    out.push_back(full[static_cast<size_t>(s * total + n_past + i)]);
+            return out;
         }
 
         // LLaDA-Image's QueryFormer consumes the raw token embeddings before the backbone runs,

@@ -156,6 +156,7 @@ int main(int argc, const char** argv) {
     register_index_endpoints(svr, svr_params, index_html);
     register_media_view_endpoint(svr, svr_params);
     register_openai_api_endpoints(svr, runtime);
+    register_chat_endpoints(svr, runtime);
     register_sdapi_endpoints(svr, runtime);
     register_sdcpp_api_endpoints(svr, runtime);
     register_dgl_endpoints(svr, runtime);

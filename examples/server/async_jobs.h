@@ -93,6 +93,33 @@ struct AsyncJobManager {
     void record_context_job_completion(const SDSvrParams& params);
 };
 
+// RAII guard for synchronous context work (image generation, chat): keeps the idle
+// weight-release worker from unloading weights while the job runs and refreshes the
+// staging/residency TTL deadlines on completion.
+class SynchronousContextJob {
+    AsyncJobManager& manager_;
+    const SDSvrParams& params_;
+
+public:
+    explicit SynchronousContextJob(const ServerRuntime& runtime)
+        : manager_(*runtime.async_job_manager), params_(*runtime.svr_params) {
+        std::lock_guard<std::mutex> lock(manager_.mutex);
+        ++manager_.synchronous_jobs;
+    }
+
+    SynchronousContextJob(const SynchronousContextJob&)            = delete;
+    SynchronousContextJob& operator=(const SynchronousContextJob&) = delete;
+
+    ~SynchronousContextJob() {
+        {
+            std::lock_guard<std::mutex> lock(manager_.mutex);
+            --manager_.synchronous_jobs;
+            manager_.record_context_job_completion(params_);
+        }
+        manager_.cv.notify_one();
+    }
+};
+
 void purge_expired_jobs(AsyncJobManager& manager);
 size_t count_pending_jobs(const AsyncJobManager& manager);
 std::string make_async_job_id(AsyncJobManager& manager);
