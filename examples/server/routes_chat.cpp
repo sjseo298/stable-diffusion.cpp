@@ -85,11 +85,28 @@ namespace {
                 error = "unsupported message role: " + role;
                 return false;
             }
-            if (!m.contains("content") || !m["content"].is_string()) {
-                error = "message content must be a string";
+            // OpenAI content: plain string, array of typed parts, or null (assistant
+            // tool-call turns). Clients like opencode/AI-SDK send the parts form.
+            std::string content;
+            if (!m.contains("content") || m["content"].is_null()) {
+                content = "";
+            } else if (m["content"].is_string()) {
+                content = m["content"].get<std::string>();
+            } else if (m["content"].is_array()) {
+                for (const auto& part : m["content"]) {
+                    const std::string type = part.value("type", "");
+                    if (type == "text") {
+                        content += part.value("text", "");
+                    } else {
+                        error = "only text content parts are supported (got '" + type + "')";
+                        return false;
+                    }
+                }
+            } else {
+                error = "message content must be a string or an array of text parts";
                 return false;
             }
-            chat.messages.push_back({role, m["content"].get<std::string>()});
+            chat.messages.push_back({role, content});
         }
         chat.max_tokens  = std::max(1, j.value("max_tokens", 256));
         chat.temperature  = j.value("temperature", 0.f);
