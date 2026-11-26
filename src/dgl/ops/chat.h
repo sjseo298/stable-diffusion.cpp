@@ -18,7 +18,7 @@ namespace sd::dgl::ops {
     struct ChatRequest {
         std::vector<ChatMessage> messages;
         int max_tokens         = 256;
-        int max_context_tokens = 4096;
+        int max_context_tokens = 32768;
 
         // Text encoder to reuse. When text_encoder_path is set, the encoder is resolved
         // through the same resource cache as image generation (loaded on demand if absent).
